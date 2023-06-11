@@ -216,7 +216,33 @@ func (e *Endpoints) process(ctx context.Context, ch chan<- []*targetgroup.Group)
 		level.Error(e.logger).Log("msg", "converting to Endpoints object failed", "err", err)
 		return true
 	}
-	send(ctx, ch, e.buildEndpoints(eps))
+
+	source, labels, targetCh := e.buildEndpoints(eps)
+	const batch = 100
+	var n int
+	targets := make([]model.LabelSet, 0, batch)
+
+	for target := range targetCh {
+		n++
+		targets = append(targets, target)
+
+		if n >= batch {
+			send(ctx, ch, &targetgroup.Group{
+				Targets: targets,
+				Labels:  labels.Clone(),
+				Source:  source,
+			})
+			n = 0
+			targets = make([]model.LabelSet, 0, batch)
+		}
+	}
+	if n > 0 {
+		send(ctx, ch, &targetgroup.Group{
+			Targets: targets,
+			Labels:  labels.Clone(),
+			Source:  source,
+		})
+	}
 	return true
 }
 
@@ -250,7 +276,7 @@ const (
 	endpointAddressTargetNameLabel = metaLabelPrefix + "endpoint_address_target_name"
 )
 
-func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) *targetgroup.Group {
+func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) (string, model.LabelSet, <-chan model.LabelSet) {
 	tg := &targetgroup.Group{
 		Source: endpointsSource(eps),
 	}
@@ -266,132 +292,135 @@ func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) *targetgroup.Group {
 		tg.Labels[model.LabelName(endpointsLabelPresentPrefix+ln)] = presentValue
 	}
 
-	type podEntry struct {
-		pod          *apiv1.Pod
-		servicePorts []apiv1.EndpointPort
-	}
-	seenPods := map[string]*podEntry{}
-
-	add := func(addr apiv1.EndpointAddress, port apiv1.EndpointPort, ready string) {
-		a := net.JoinHostPort(addr.IP, strconv.FormatUint(uint64(port.Port), 10))
-
-		target := model.LabelSet{
-			model.AddressLabel:        lv(a),
-			endpointPortNameLabel:     lv(port.Name),
-			endpointPortProtocolLabel: lv(string(port.Protocol)),
-			endpointReadyLabel:        lv(ready),
+	out := make(chan model.LabelSet, 1)
+	go func() {
+		defer close(out)
+		type podEntry struct {
+			pod          *apiv1.Pod
+			servicePorts []apiv1.EndpointPort
 		}
+		seenPods := map[string]*podEntry{}
 
-		if addr.TargetRef != nil {
-			target[model.LabelName(endpointAddressTargetKindLabel)] = lv(addr.TargetRef.Kind)
-			target[model.LabelName(endpointAddressTargetNameLabel)] = lv(addr.TargetRef.Name)
-		}
+		add := func(addr apiv1.EndpointAddress, port apiv1.EndpointPort, ready string) {
+			a := net.JoinHostPort(addr.IP, strconv.FormatUint(uint64(port.Port), 10))
 
-		if addr.NodeName != nil {
-			target[model.LabelName(endpointNodeName)] = lv(*addr.NodeName)
-		}
-		if addr.Hostname != "" {
-			target[model.LabelName(endpointHostname)] = lv(addr.Hostname)
-		}
-
-		if e.withNodeMetadata {
-			target = addNodeLabels(target, e.nodeInf, e.logger, addr.NodeName)
-		}
-
-		pod := e.resolvePodRef(addr.TargetRef)
-		if pod == nil {
-			// This target is not a Pod, so don't continue with Pod specific logic.
-			tg.Targets = append(tg.Targets, target)
-			return
-		}
-		s := pod.Namespace + "/" + pod.Name
-
-		sp, ok := seenPods[s]
-		if !ok {
-			sp = &podEntry{pod: pod}
-			seenPods[s] = sp
-		}
-
-		// Attach standard pod labels.
-		target = target.Merge(podLabels(pod))
-
-		// Attach potential container port labels matching the endpoint port.
-		for _, c := range pod.Spec.Containers {
-			for _, cport := range c.Ports {
-				if port.Port == cport.ContainerPort {
-					ports := strconv.FormatUint(uint64(port.Port), 10)
-
-					target[podContainerNameLabel] = lv(c.Name)
-					target[podContainerImageLabel] = lv(c.Image)
-					target[podContainerPortNameLabel] = lv(cport.Name)
-					target[podContainerPortNumberLabel] = lv(ports)
-					target[podContainerPortProtocolLabel] = lv(string(port.Protocol))
-					break
-				}
+			target := model.LabelSet{
+				model.AddressLabel:        lv(a),
+				endpointPortNameLabel:     lv(port.Name),
+				endpointPortProtocolLabel: lv(string(port.Protocol)),
+				endpointReadyLabel:        lv(ready),
 			}
-		}
 
-		// Add service port so we know that we have already generated a target
-		// for it.
-		sp.servicePorts = append(sp.servicePorts, port)
-		tg.Targets = append(tg.Targets, target)
-	}
-
-	for _, ss := range eps.Subsets {
-		for _, port := range ss.Ports {
-			for _, addr := range ss.Addresses {
-				add(addr, port, "true")
+			if addr.TargetRef != nil {
+				target[model.LabelName(endpointAddressTargetKindLabel)] = lv(addr.TargetRef.Kind)
+				target[model.LabelName(endpointAddressTargetNameLabel)] = lv(addr.TargetRef.Name)
 			}
-			// Although this generates the same target again, as it was generated in
-			// the loop above, it causes the ready meta label to be overridden.
-			for _, addr := range ss.NotReadyAddresses {
-				add(addr, port, "false")
+
+			if addr.NodeName != nil {
+				target[model.LabelName(endpointNodeName)] = lv(*addr.NodeName)
 			}
-		}
-	}
+			if addr.Hostname != "" {
+				target[model.LabelName(endpointHostname)] = lv(addr.Hostname)
+			}
 
-	v := eps.Labels[apiv1.EndpointsOverCapacity]
-	if v == "truncated" {
-		level.Warn(e.logger).Log("msg", "Number of endpoints in one Endpoints object exceeds 1000 and has been truncated, please use \"role: endpointslice\" instead", "endpoint", eps.Name)
-	}
-	if v == "warning" {
-		level.Warn(e.logger).Log("msg", "Number of endpoints in one Endpoints object exceeds 1000, please use \"role: endpointslice\" instead", "endpoint", eps.Name)
-	}
+			if e.withNodeMetadata {
+				target = addNodeLabels(target, e.nodeInf, e.logger, addr.NodeName)
+			}
 
-	// For all seen pods, check all container ports. If they were not covered
-	// by one of the service endpoints, generate targets for them.
-	for _, pe := range seenPods {
-		for _, c := range pe.pod.Spec.Containers {
-			for _, cport := range c.Ports {
-				hasSeenPort := func() bool {
-					for _, eport := range pe.servicePorts {
-						if cport.ContainerPort == eport.Port {
-							return true
-						}
+			pod := e.resolvePodRef(addr.TargetRef)
+			if pod == nil {
+				// This target is not a Pod, so don't continue with Pod specific logic.
+				out <- target
+				return
+			}
+			s := pod.Namespace + "/" + pod.Name
+
+			sp, ok := seenPods[s]
+			if !ok {
+				sp = &podEntry{pod: pod}
+				seenPods[s] = sp
+			}
+
+			// Attach standard pod labels.
+			target = target.Merge(podLabels(pod))
+
+			// Attach potential container port labels matching the endpoint port.
+			for _, c := range pod.Spec.Containers {
+				for _, cport := range c.Ports {
+					if port.Port == cport.ContainerPort {
+						ports := strconv.FormatUint(uint64(port.Port), 10)
+
+						target[podContainerNameLabel] = lv(c.Name)
+						target[podContainerImageLabel] = lv(c.Image)
+						target[podContainerPortNameLabel] = lv(cport.Name)
+						target[podContainerPortNumberLabel] = lv(ports)
+						target[podContainerPortProtocolLabel] = lv(string(port.Protocol))
+						break
 					}
-					return false
 				}
-				if hasSeenPort() {
-					continue
-				}
+			}
 
-				a := net.JoinHostPort(pe.pod.Status.PodIP, strconv.FormatUint(uint64(cport.ContainerPort), 10))
-				ports := strconv.FormatUint(uint64(cport.ContainerPort), 10)
+			// Add service port so we know that we have already generated a target
+			// for it.
+			sp.servicePorts = append(sp.servicePorts, port)
+			out <- target
+		}
 
-				target := model.LabelSet{
-					model.AddressLabel:            lv(a),
-					podContainerNameLabel:         lv(c.Name),
-					podContainerImageLabel:        lv(c.Image),
-					podContainerPortNameLabel:     lv(cport.Name),
-					podContainerPortNumberLabel:   lv(ports),
-					podContainerPortProtocolLabel: lv(string(cport.Protocol)),
+		for _, ss := range eps.Subsets {
+			for _, port := range ss.Ports {
+				for _, addr := range ss.Addresses {
+					add(addr, port, "true")
 				}
-				tg.Targets = append(tg.Targets, target.Merge(podLabels(pe.pod)))
+				// Although this generates the same target again, as it was generated in
+				// the loop above, it causes the ready meta label to be overridden.
+				for _, addr := range ss.NotReadyAddresses {
+					add(addr, port, "false")
+				}
 			}
 		}
-	}
 
-	return tg
+		v := eps.Labels[apiv1.EndpointsOverCapacity]
+		if v == "truncated" {
+			level.Warn(e.logger).Log("msg", "Number of endpoints in one Endpoints object exceeds 1000 and has been truncated, please use \"role: endpointslice\" instead", "endpoint", eps.Name)
+		}
+		if v == "warning" {
+			level.Warn(e.logger).Log("msg", "Number of endpoints in one Endpoints object exceeds 1000, please use \"role: endpointslice\" instead", "endpoint", eps.Name)
+		}
+
+		// For all seen pods, check all container ports. If they were not covered
+		// by one of the service endpoints, generate targets for them.
+		for _, pe := range seenPods {
+			for _, c := range pe.pod.Spec.Containers {
+				for _, cport := range c.Ports {
+					hasSeenPort := func() bool {
+						for _, eport := range pe.servicePorts {
+							if cport.ContainerPort == eport.Port {
+								return true
+							}
+						}
+						return false
+					}
+					if hasSeenPort() {
+						continue
+					}
+
+					a := net.JoinHostPort(pe.pod.Status.PodIP, strconv.FormatUint(uint64(cport.ContainerPort), 10))
+					ports := strconv.FormatUint(uint64(cport.ContainerPort), 10)
+
+					target := model.LabelSet{
+						model.AddressLabel:            lv(a),
+						podContainerNameLabel:         lv(c.Name),
+						podContainerImageLabel:        lv(c.Image),
+						podContainerPortNameLabel:     lv(cport.Name),
+						podContainerPortNumberLabel:   lv(ports),
+						podContainerPortProtocolLabel: lv(string(cport.Protocol)),
+					}
+					out <- target.Merge(podLabels(pe.pod))
+				}
+			}
+		}
+	}()
+	return tg.Source, tg.Labels, out
 }
 
 func (e *Endpoints) resolvePodRef(ref *apiv1.ObjectReference) *apiv1.Pod {
