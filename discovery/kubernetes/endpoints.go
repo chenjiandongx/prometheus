@@ -220,10 +220,12 @@ func (e *Endpoints) process(ctx context.Context, ch chan<- []*targetgroup.Group)
 	source, labels, targetCh := e.buildEndpoints(eps)
 	const batch = 100
 	var n int
-	targets := make([]model.LabelSet, 0, batch)
+	var targets []model.LabelSet
 
+	var seen bool
 	for target := range targetCh {
 		n++
+		seen = true
 		targets = append(targets, target)
 
 		if n >= batch {
@@ -236,7 +238,9 @@ func (e *Endpoints) process(ctx context.Context, ch chan<- []*targetgroup.Group)
 			targets = make([]model.LabelSet, 0, batch)
 		}
 	}
-	if n > 0 {
+
+	// if there is no targets found, empty targets slice should be sent here
+	if n > 0 || !seen {
 		send(ctx, ch, &targetgroup.Group{
 			Targets: targets,
 			Labels:  labels.Clone(),
@@ -293,78 +297,79 @@ func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) (string, model.LabelSet
 	}
 
 	out := make(chan model.LabelSet, 1)
-	go func() {
-		defer close(out)
-		type podEntry struct {
-			pod          *apiv1.Pod
-			servicePorts []apiv1.EndpointPort
+	type podEntry struct {
+		pod          *apiv1.Pod
+		servicePorts []apiv1.EndpointPort
+	}
+	seenPods := map[string]*podEntry{}
+
+	add := func(addr apiv1.EndpointAddress, port apiv1.EndpointPort, ready string) {
+		a := net.JoinHostPort(addr.IP, strconv.FormatUint(uint64(port.Port), 10))
+
+		target := model.LabelSet{
+			model.AddressLabel:        lv(a),
+			endpointPortNameLabel:     lv(port.Name),
+			endpointPortProtocolLabel: lv(string(port.Protocol)),
+			endpointReadyLabel:        lv(ready),
 		}
-		seenPods := map[string]*podEntry{}
 
-		add := func(addr apiv1.EndpointAddress, port apiv1.EndpointPort, ready string) {
-			a := net.JoinHostPort(addr.IP, strconv.FormatUint(uint64(port.Port), 10))
+		if addr.TargetRef != nil {
+			target[model.LabelName(endpointAddressTargetKindLabel)] = lv(addr.TargetRef.Kind)
+			target[model.LabelName(endpointAddressTargetNameLabel)] = lv(addr.TargetRef.Name)
+		}
 
-			target := model.LabelSet{
-				model.AddressLabel:        lv(a),
-				endpointPortNameLabel:     lv(port.Name),
-				endpointPortProtocolLabel: lv(string(port.Protocol)),
-				endpointReadyLabel:        lv(ready),
-			}
+		if addr.NodeName != nil {
+			target[model.LabelName(endpointNodeName)] = lv(*addr.NodeName)
+		}
+		if addr.Hostname != "" {
+			target[model.LabelName(endpointHostname)] = lv(addr.Hostname)
+		}
 
-			if addr.TargetRef != nil {
-				target[model.LabelName(endpointAddressTargetKindLabel)] = lv(addr.TargetRef.Kind)
-				target[model.LabelName(endpointAddressTargetNameLabel)] = lv(addr.TargetRef.Name)
-			}
+		if e.withNodeMetadata {
+			target = addNodeLabels(target, e.nodeInf, e.logger, addr.NodeName)
+		}
 
-			if addr.NodeName != nil {
-				target[model.LabelName(endpointNodeName)] = lv(*addr.NodeName)
-			}
-			if addr.Hostname != "" {
-				target[model.LabelName(endpointHostname)] = lv(addr.Hostname)
-			}
+		pod := e.resolvePodRef(addr.TargetRef)
+		if pod == nil {
+			// This target is not a Pod, so don't continue with Pod specific logic.
+			out <- target
+			return
+		}
+		s := pod.Namespace + "/" + pod.Name
 
-			if e.withNodeMetadata {
-				target = addNodeLabels(target, e.nodeInf, e.logger, addr.NodeName)
-			}
+		sp, ok := seenPods[s]
+		if !ok {
+			sp = &podEntry{pod: pod}
+			seenPods[s] = sp
+		}
 
-			pod := e.resolvePodRef(addr.TargetRef)
-			if pod == nil {
-				// This target is not a Pod, so don't continue with Pod specific logic.
-				out <- target
-				return
-			}
-			s := pod.Namespace + "/" + pod.Name
+		// Attach standard pod labels.
+		target = target.Merge(podLabels(pod))
 
-			sp, ok := seenPods[s]
-			if !ok {
-				sp = &podEntry{pod: pod}
-				seenPods[s] = sp
-			}
+		// Attach potential container port labels matching the endpoint port.
+		for _, c := range pod.Spec.Containers {
+			for _, cport := range c.Ports {
+				if port.Port == cport.ContainerPort {
+					ports := strconv.FormatUint(uint64(port.Port), 10)
 
-			// Attach standard pod labels.
-			target = target.Merge(podLabels(pod))
-
-			// Attach potential container port labels matching the endpoint port.
-			for _, c := range pod.Spec.Containers {
-				for _, cport := range c.Ports {
-					if port.Port == cport.ContainerPort {
-						ports := strconv.FormatUint(uint64(port.Port), 10)
-
-						target[podContainerNameLabel] = lv(c.Name)
-						target[podContainerImageLabel] = lv(c.Image)
-						target[podContainerPortNameLabel] = lv(cport.Name)
-						target[podContainerPortNumberLabel] = lv(ports)
-						target[podContainerPortProtocolLabel] = lv(string(port.Protocol))
-						break
-					}
+					target[podContainerNameLabel] = lv(c.Name)
+					target[podContainerImageLabel] = lv(c.Image)
+					target[podContainerPortNameLabel] = lv(cport.Name)
+					target[podContainerPortNumberLabel] = lv(ports)
+					target[podContainerPortProtocolLabel] = lv(string(port.Protocol))
+					break
 				}
 			}
-
-			// Add service port so we know that we have already generated a target
-			// for it.
-			sp.servicePorts = append(sp.servicePorts, port)
-			out <- target
 		}
+
+		// Add service port so we know that we have already generated a target
+		// for it.
+		sp.servicePorts = append(sp.servicePorts, port)
+		out <- target
+	}
+
+	go func() {
+		defer close(out)
 
 		for _, ss := range eps.Subsets {
 			for _, port := range ss.Ports {
